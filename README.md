@@ -616,4 +616,4 @@ Posibles mejoras:
 
 # Licencia
 
-Proyecto desarrollado por Alejandro Hugo / B-Kontrol.
+Proyecto desarrollado por Alejandro Hugo / b-konnet.
