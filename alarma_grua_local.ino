@@ -180,7 +180,7 @@ void loop() {
   for (int i = 0; i < 4; i++) {
     String cmd = makeCmd(String(IDS[i]), "03");
     pollOne(cmd);
-    leerReset();
+      // leerReset();   // DESACTIVADO: la caja local no tiene botón físico
     delay(10);
   }
 
