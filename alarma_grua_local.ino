@@ -70,6 +70,11 @@ bool allSensorsFresh(uint32_t now) {
   for (uint8_t i = 0; i < 4; ++i) if (!sensorFresh(i, now)) return false;
   return true;
 }
+bool safeMeasurements(uint32_t now) {
+  return allSensorsFresh(now) && pata55 > ALARM_OFF_MM &&
+         pata56 > ALARM_OFF_MM && pata57 > ALARM_OFF_MM &&
+         pata07 > ALARM_OFF_MM;
+}
 
 
 const char* IDS[4] = {"55", "56", "57", "07"};
@@ -375,11 +380,7 @@ void evaluarAlarma() {
     (fresh[2] && pata57 < ALARM_ON_MM) ||
     (fresh[3] && pata07 < ALARM_ON_MM);
 
-  bool todasAltas = allSensorsFresh(now) &&
-    pata55 > ALARM_OFF_MM &&
-    pata56 > ALARM_OFF_MM &&
-    pata57 > ALARM_OFF_MM &&
-    pata07 > ALARM_OFF_MM;
+  bool todasAltas = safeMeasurements(now);
 
   // La perdida de un sensor cancela el conteo de silencio; no confirma seguridad.
   if (condSegura && !todasAltas) {
@@ -457,7 +458,7 @@ void leerReset() {
   if (last == HIGH && estado == LOW) {
     Serial.println("RESET PRESIONADO");
 
-    if (!alarmaActiva && condSegura && allSensorsFresh(millis())) {
+    if (!alarmaActiva && condSegura && safeMeasurements(millis())) {
       // Condición normalizada: apagar latch
       alarmaLatch      = false;
       condSegura       = false;
@@ -669,7 +670,7 @@ void leerComandosRadio() {
 void procesarComandoRadio(const String& cmd) {
   if (cmd == "BORRA") {
     Serial.println("COMANDO RADIO: BORRA");
-    if (!alarmaActiva && condSegura && allSensorsFresh(millis())) {
+    if (!alarmaActiva && condSegura && safeMeasurements(millis())) {
       alarmaLatch      = false;
       condSegura       = false;
       alarmMaskLatched = 0;
@@ -686,7 +687,7 @@ void procesarComandoRadio(const String& cmd) {
   } else if (cmd == "RESET") {
     // Compatible con la remota V1.01; nunca se permite borrar peligro activo.
     Serial.println("COMANDO RADIO: RESET");
-    if (!alarmaActiva && condSegura && allSensorsFresh(millis())) {
+    if (!alarmaActiva && condSegura && safeMeasurements(millis())) {
       alarmaLatch      = false;
       condSegura       = false;
       alarmMaskLatched = 0;
