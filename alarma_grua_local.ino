@@ -42,6 +42,14 @@ uint32_t lastRadioTxMs = 0;
 #define ALARM_AUTO_SILENCE_MS 15000UL
 // Lecturas caducadas no pueden confirmar una condicion segura.
 #define SENSOR_FRESH_MS 5000UL
+// Sirena de falla de sensor: 1 segundo ON, 4 segundos OFF (12 ciclos/minuto).
+#define SENSOR_FAULT_ON_MS 1000UL
+#define SENSOR_FAULT_OFF_MS 4000UL
+#define SENSOR_FAULT_PERIOD_MS (SENSOR_FAULT_ON_MS + SENSOR_FAULT_OFF_MS)
+// Dar tiempo al primer ciclo de consultas antes de avisar falla de sensor.
+#define SENSOR_STARTUP_GRACE_MS 5000UL
+uint32_t sensorFaultStartMs = 0;
+bool sensorFaultWasActive = false;
 
 bool alarmaActiva = false;  // condición física (con histéresis)
 bool alarmaLatch  = false;  // relay enclavado hasta reset o timeout
@@ -443,8 +451,14 @@ void evaluarAlarma() {
     Serial.println(">>> ALARMA RE-ACTIVADA durante espera de timeout");
   }
 
-  digitalWrite(RELAY_PIN, alarmaLatch ? RELAY_ON : RELAY_OFF);
-  Serial.print("RELAY="); Serial.println(alarmaLatch ? "ON" : "OFF");
+  // Prioridad absoluta: una alarma de peligro latcheada siempre es continua.
+  // Solo si no hay peligro: indicar falla de uno o mas sensores con ciclo lento.
+  bool sensorFault = (now >= SENSOR_STARTUP_GRACE_MS) && !allSensorsFresh(now);
+  if (sensorFault && !sensorFaultWasActive) sensorFaultStartMs = now;
+  sensorFaultWasActive = sensorFault;
+  bool relayOn = alarmaLatch ||
+    (sensorFault && (uint32_t)(now - sensorFaultStartMs) % SENSOR_FAULT_PERIOD_MS < SENSOR_FAULT_ON_MS);
+  digitalWrite(RELAY_PIN, relayOn ? RELAY_ON : RELAY_OFF);
 }
 
 // ==================================================
