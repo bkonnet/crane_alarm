@@ -40,6 +40,16 @@ uint32_t lastRadioTxMs = 0;
 
 // Tiempo máximo sonando cuando la condición YA se normalizó
 #define ALARM_AUTO_SILENCE_MS 15000UL
+// Lecturas caducadas no pueden confirmar una condicion segura.
+#define SENSOR_FRESH_MS 5000UL
+// Sirena de falla de sensor: 1 segundo ON, 4 segundos OFF (12 ciclos/minuto).
+#define SENSOR_FAULT_ON_MS 1000UL
+#define SENSOR_FAULT_OFF_MS 4000UL
+#define SENSOR_FAULT_PERIOD_MS (SENSOR_FAULT_ON_MS + SENSOR_FAULT_OFF_MS)
+// Dar tiempo al primer ciclo de consultas antes de avisar falla de sensor.
+#define SENSOR_STARTUP_GRACE_MS 5000UL
+uint32_t sensorFaultStartMs = 0;
+bool sensorFaultWasActive = false;
 
 bool alarmaActiva = false;  // condición física (con histéresis)
 bool alarmaLatch  = false;  // relay enclavado hasta reset o timeout
@@ -57,6 +67,23 @@ int pata55 = 9999;
 int pata56 = 9999;
 int pata57 = 9999;
 int pata07 = 9999;
+
+// Una medicion solo es valida tras recibir una trama correcta, nunca por el valor 9999.
+uint32_t lastGoodMs[4] = {0, 0, 0, 0};
+bool everGood[4] = {false, false, false, false};
+bool sensorFresh(uint8_t index, uint32_t now) {
+  return everGood[index] && (uint32_t)(now - lastGoodMs[index]) <= SENSOR_FRESH_MS;
+}
+bool allSensorsFresh(uint32_t now) {
+  for (uint8_t i = 0; i < 4; ++i) if (!sensorFresh(i, now)) return false;
+  return true;
+}
+bool safeMeasurements(uint32_t now) {
+  return allSensorsFresh(now) && pata55 > ALARM_OFF_MM &&
+         pata56 > ALARM_OFF_MM && pata57 > ALARM_OFF_MM &&
+         pata07 > ALARM_OFF_MM;
+}
+
 
 const char* IDS[4] = {"55", "56", "57", "07"};
 
@@ -228,10 +255,10 @@ void pollOne(const String& cmd) {
   } else {
     if (cmd.length() >= 3) {
       String id = cmd.substring(1, 3);
-      if (id == "55") miss55++;
-      else if (id == "56") miss56++;
-      else if (id == "57") miss57++;
-      else if (id == "07") miss07++;
+      if (id == "55" && miss55 < UINT16_MAX) miss55++;
+      else if (id == "56" && miss56 < UINT16_MAX) miss56++;
+      else if (id == "57" && miss57 < UINT16_MAX) miss57++;
+      else if (id == "07" && miss07 < UINT16_MAX) miss07++;
     }
     Serial.print("SIN RESPUESTA a: ");
     Serial.println(cmd);
@@ -310,27 +337,27 @@ void procesarDato(const String& tramaIn) {
     lrcOK = (expected == got);
   }
 
+  // Nunca aceptar una distancia si falla su integridad LRC.
   if (!distOK || !lrcHexOK || !lrcOK) {
-    if (*bad == 0) {
-      *bad = 1;
-      Serial.print("TRAMA INVALIDA descartada PATA ");
-      Serial.println(labelFromId(id));
-      return;
-    } else {
-      *bad = 0;
-      if (!distOK) return;
-    }
-  } else {
-    *bad = 0;
+    if (*bad < UINT8_MAX) ++(*bad);
+    Serial.print("TRAMA INVALIDA descartada PATA ");
+    Serial.println(labelFromId(id));
+    return;
   }
+  *bad = 0;
 
   long distancia = distStr.toInt();
   if (distancia <= 0) return;
 
-  if      (id == "55") { pata55 = (int)distancia; miss55 = 0; }
-  else if (id == "56") { pata56 = (int)distancia; miss56 = 0; }
-  else if (id == "57") { pata57 = (int)distancia; miss57 = 0; }
-  else if (id == "07") { pata07 = (int)distancia; miss07 = 0; }
+  int index = -1;
+  if      (id == "55") { pata55 = (int)distancia; miss55 = 0; index = 0; }
+  else if (id == "56") { pata56 = (int)distancia; miss56 = 0; index = 1; }
+  else if (id == "57") { pata57 = (int)distancia; miss57 = 0; index = 2; }
+  else if (id == "07") { pata07 = (int)distancia; miss07 = 0; index = 3; }
+  if (index >= 0) {
+    lastGoodMs[index] = millis();
+    everGood[index] = true;
+  }
 
   Serial.print("PATA "); Serial.print(labelFromId(id));
   Serial.print(" = "); Serial.print(distancia);
@@ -351,17 +378,24 @@ void procesarDato(const String& tramaIn) {
 void evaluarAlarma() {
   uint32_t now = millis();
 
+  bool fresh[4] = {
+    sensorFresh(0, now), sensorFresh(1, now),
+    sensorFresh(2, now), sensorFresh(3, now)
+  };
   bool algunaBaja =
-    pata55 < ALARM_ON_MM ||
-    pata56 < ALARM_ON_MM ||
-    pata57 < ALARM_ON_MM ||
-    pata07 < ALARM_ON_MM;
+    (fresh[0] && pata55 < ALARM_ON_MM) ||
+    (fresh[1] && pata56 < ALARM_ON_MM) ||
+    (fresh[2] && pata57 < ALARM_ON_MM) ||
+    (fresh[3] && pata07 < ALARM_ON_MM);
 
-  bool todasAltas =
-    pata55 > ALARM_OFF_MM &&
-    pata56 > ALARM_OFF_MM &&
-    pata57 > ALARM_OFF_MM &&
-    pata07 > ALARM_OFF_MM;
+  bool todasAltas = safeMeasurements(now);
+
+  // La perdida de un sensor cancela el conteo de silencio; no confirma seguridad.
+  if (condSegura && !todasAltas) {
+    condSegura = false;
+    if (alarmaLatch) alarmaActiva = true;
+    Serial.println(">>> FIN CONDICION SEGURA: lectura vencida o distancia no segura");
+  }
 
   // --- Activación ---
   if (!alarmaActiva && algunaBaja) {
@@ -388,7 +422,7 @@ void evaluarAlarma() {
   }
 
   // --- Timeout de 15 s (solo cuando la condición ya está bien) ---
-  if (alarmaLatch && condSegura &&
+  if (alarmaLatch && condSegura && todasAltas &&
       (now - alarmaSeguraMs >= ALARM_AUTO_SILENCE_MS)) {
 
     alarmaLatch      = false;
@@ -417,8 +451,14 @@ void evaluarAlarma() {
     Serial.println(">>> ALARMA RE-ACTIVADA durante espera de timeout");
   }
 
-  digitalWrite(RELAY_PIN, alarmaLatch ? RELAY_ON : RELAY_OFF);
-  Serial.print("RELAY="); Serial.println(alarmaLatch ? "ON" : "OFF");
+  // Prioridad absoluta: una alarma de peligro latcheada siempre es continua.
+  // Solo si no hay peligro: indicar falla de uno o mas sensores con ciclo lento.
+  bool sensorFault = (now >= SENSOR_STARTUP_GRACE_MS) && !allSensorsFresh(now);
+  if (sensorFault && !sensorFaultWasActive) sensorFaultStartMs = now;
+  sensorFaultWasActive = sensorFault;
+  bool relayOn = alarmaLatch ||
+    (sensorFault && (uint32_t)(now - sensorFaultStartMs) % SENSOR_FAULT_PERIOD_MS < SENSOR_FAULT_ON_MS);
+  digitalWrite(RELAY_PIN, relayOn ? RELAY_ON : RELAY_OFF);
 }
 
 // ==================================================
@@ -432,7 +472,7 @@ void leerReset() {
   if (last == HIGH && estado == LOW) {
     Serial.println("RESET PRESIONADO");
 
-    if (!alarmaActiva) {
+    if (!alarmaActiva && condSegura && safeMeasurements(millis())) {
       // Condición normalizada: apagar latch
       alarmaLatch      = false;
       condSegura       = false;
@@ -644,7 +684,7 @@ void leerComandosRadio() {
 void procesarComandoRadio(const String& cmd) {
   if (cmd == "BORRA") {
     Serial.println("COMANDO RADIO: BORRA");
-    if (!alarmaActiva) {
+    if (!alarmaActiva && condSegura && safeMeasurements(millis())) {
       alarmaLatch      = false;
       condSegura       = false;
       alarmMaskLatched = 0;
@@ -659,23 +699,28 @@ void procesarComandoRadio(const String& cmd) {
       Serial.println("BORRA POR RADIO RECHAZADO");
     }
   } else if (cmd == "RESET") {
+    // Compatible con la remota V1.01; nunca se permite borrar peligro activo.
     Serial.println("COMANDO RADIO: RESET");
-    alarmaActiva     = false;
-    alarmaLatch      = false;
-    condSegura       = false;
-    alarmMaskLatched = 0;
-    uiMsgLine1   = "RESET TOTAL";
-    uiMsgLine2   = "POR RADIO";
-    uiMsgUntilMs = millis() + 2000;
-    Serial.println("RESET TOTAL POR RADIO EJECUTADO");
+    if (!alarmaActiva && condSegura && safeMeasurements(millis())) {
+      alarmaLatch      = false;
+      condSegura       = false;
+      alarmMaskLatched = 0;
+      uiMsgLine1   = "ALARMA BORRADA";
+      uiMsgLine2   = "POR RADIO";
+      uiMsgUntilMs = millis() + 2000;
+      Serial.println("RESET POR RADIO ACEPTADO: CONDICION SEGURA");
+    } else {
+      Serial.println("RESET POR RADIO RECHAZADO: PELIGRO O SENSOR NO VALIDO");
+    }
   }
 }
 
 void enviarEstadoRadio() {
-  bool off1 = (miss55 >= MISS_LIMIT);
-  bool off2 = (miss56 >= MISS_LIMIT);
-  bool off3 = (miss57 >= MISS_LIMIT);
-  bool off4 = (miss07 >= MISS_LIMIT);
+  uint32_t now = millis();
+  bool off1 = (miss55 >= MISS_LIMIT) || !sensorFresh(0, now);
+  bool off2 = (miss56 >= MISS_LIMIT) || !sensorFresh(1, now);
+  bool off3 = (miss57 >= MISS_LIMIT) || !sensorFresh(2, now);
+  bool off4 = (miss07 >= MISS_LIMIT) || !sensorFresh(3, now);
 
   RADIO.print("$");
   RADIO.print(pata55); RADIO.print(",");
